@@ -516,11 +516,62 @@ def analyze_opportunities_trends(opportunities: List[Dict]) -> Dict:
     all_titles = " ".join([opp['title'].lower() for opp in opportunities])
     all_content = " ".join([opp['selftext'].lower()[:200] for opp in opportunities if opp['selftext']])
     
-    # Parole chiave più frequenti (filtrate)
+    # Parole chiave più frequenti (filtrate con stopwords estese)
     import re
     words = re.findall(r'\b[a-záàéèíìóòúù]{4,}\b', all_titles + " " + all_content)
-    stop_words = {'sono', 'della', 'per', 'con', 'una', 'che', 'più', 'come', 'dove', 'quando', 'cosa', 'qualcuno', 'molto', 'poco', 'tutto', 'anche', 'ancora', 'sempre', 'mai', 'già', 'prima', 'dopo', 'oggi', 'ieri', 'domani'}
-    filtered_words = [w for w in words if w not in stop_words and len(w) > 3]
+    
+    # Stopwords estese per italiano
+    stop_words = {
+        # Articoli, preposizioni, congiunzioni
+        'sono', 'della', 'delle', 'dello', 'degli', 'nella', 'nelle', 'nello', 'negli',
+        'dalla', 'dalle', 'dallo', 'dagli', 'alla', 'alle', 'allo', 'agli', 'sulla',
+        'sulle', 'sullo', 'sugli', 'per', 'con', 'una', 'uno', 'che', 'più', 'come',
+        'dove', 'quando', 'cosa', 'qualcuno', 'molto', 'poco', 'tutto', 'anche',
+        'ancora', 'sempre', 'mai', 'già', 'prima', 'dopo', 'oggi', 'ieri', 'domani',
+        'questa', 'questo', 'questi', 'queste', 'quello', 'quella', 'quelli', 'quelle',
+        'stesso', 'stessa', 'stessi', 'stesse', 'altro', 'altra', 'altri', 'altre',
+        
+        # Verbi comuni
+        'vorrei', 'voglio', 'vuole', 'volevo', 'devo', 'deve', 'dovrei', 'posso',
+        'può', 'potrei', 'facendo', 'fare', 'fatto', 'faccio', 'fanno', 'essere',
+        'stato', 'stata', 'stati', 'state', 'avere', 'aveva', 'avevo', 'avrò',
+        'dire', 'detto', 'dice', 'dicono', 'andare', 'vado', 'viene', 'venire',
+        'mettere', 'messo', 'prendere', 'preso', 'vedere', 'visto', 'sentire',
+        'sentito', 'sapere', 'sapevo', 'uscire', 'entrare', 'rimanere', 'stare',
+        'dare', 'dato', 'portare', 'portato', 'trovare', 'trovato',
+        
+        # Avverbi e aggettivi generici
+        'bene', 'male', 'meglio', 'peggio', 'abbastanza', 'troppo', 'tanto',
+        'poco', 'parecchio', 'davvero', 'veramente', 'proprio', 'solo', 'soltanto',
+        'piuttosto', 'invece', 'infatti', 'inoltre', 'quindi', 'però', 'però',
+        'comunque', 'tuttavia', 'mentre', 'durante', 'dentro', 'fuori', 'sopra',
+        'sotto', 'vicino', 'lontano', 'grande', 'piccolo', 'nuovo', 'vecchio',
+        'giovane', 'primo', 'ultimo', 'buono', 'cattivo', 'bello', 'brutto',
+        
+        # Pronomi e particelle
+        'loro', 'nostro', 'nostra', 'nostri', 'nostre', 'vostro', 'vostra',
+        'vostri', 'vostre', 'ogni', 'alcuni', 'alcune', 'nessuno', 'nessuna',
+        'ciascuno', 'ciascuna', 'chiunque', 'ovunque', 'dovunque', 'qualsiasi',
+        'qualche', 'niente', 'nulla', 'qualcosa', 'qualcosa',
+        
+        # Parole di contesto Reddit
+        'post', 'thread', 'commento', 'commenti', 'utente', 'utenti', 'forum',
+        'discussione', 'opinione', 'opinioni', 'reddit', 'subreddit',
+        
+        # Numeri e date
+        'anno', 'anni', 'mese', 'mesi', 'settimana', 'settimane', 'giorno',
+        'giorni', 'ora', 'ore', 'minuto', 'minuti', 'tempo', 'volta', 'volte'
+    }
+    
+    # Filtra parole e mantieni solo sostantivi rilevanti
+    filtered_words = []
+    for word in words:
+        if (word not in stop_words and 
+            len(word) > 4 and  # Almeno 5 caratteri
+            not word.isdigit() and  # Non numeri
+            not any(char.isdigit() for char in word)):  # Non contiene numeri
+            filtered_words.append(word)
+    
     word_freq = Counter(filtered_words)
     
     # Subreddit più attivi
@@ -854,19 +905,33 @@ def main():
                 
                 st.markdown(f"[🔗 Vai al post Reddit]({opp['reddit_url']})")
         
-        # 8. Download files
+        # 8. Download files con session state
         st.subheader("💾 Download Risultati")
         
-        csv_content, json_content, filename_base = create_download_files(opportunities, base_topics, brand_name)
+        # Salva i risultati in session_state per evitare che scompaiano
+        if 'analysis_results' not in st.session_state:
+            st.session_state.analysis_results = {
+                'opportunities': opportunities,
+                'trends': trends,
+                'base_topics': base_topics,
+                'brand_name': brand_name
+            }
         
-        col1, col2 = st.columns(2)
+        csv_content, json_content, filename_base = create_download_files(
+            st.session_state.analysis_results['opportunities'], 
+            st.session_state.analysis_results['base_topics'], 
+            st.session_state.analysis_results['brand_name']
+        )
+        
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             st.download_button(
                 label="📊 Scarica CSV",
                 data=csv_content,
                 file_name=f"{filename_base}.csv",
-                mime="text/csv"
+                mime="text/csv",
+                key="download_csv"
             )
         
         with col2:
@@ -874,8 +939,16 @@ def main():
                 label="📄 Scarica JSON",
                 data=json_content,
                 file_name=f"{filename_base}.json",
-                mime="application/json"
+                mime="application/json",
+                key="download_json"
             )
+        
+        with col3:
+            if st.button("🔄 Nuova Analisi", key="reset_analysis"):
+                # Pulisce i risultati salvati per permettere una nuova analisi
+                if 'analysis_results' in st.session_state:
+                    del st.session_state.analysis_results
+                st.rerun()
 
 if __name__ == "__main__":
     main()
