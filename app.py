@@ -138,6 +138,38 @@ class RedditAIBusinessScraper:
             self.logger.error(f"Errore generazione value proposition: {e}")
             self.business_info['value_proposition'] = "Aiutiamo i clienti con soluzioni professionali"
     
+    def _generate_services_optimization(self):
+        """Ottimizza la descrizione dei servizi usando AI"""
+        try:
+            prompt = f"""
+            Ottimizza questa descrizione dei servizi per renderla più efficace nel contesto business e marketing:
+            
+            Servizi attuali: {self.business_info['services']}
+            
+            Contesto aziendale: {self.business_info['about_us']}
+            
+            Genera una versione ottimizzata che:
+            1. Sia più chiara e diretta
+            2. Evidenzi i benefici per il cliente
+            3. Utilizzi un linguaggio persuasivo ma professionale
+            4. Sia strutturata in modo leggibile
+            
+            Mantieni la stessa lunghezza approssimativa del testo originale.
+            """
+            
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.3
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            self.logger.error(f"Errore ottimizzazione servizi: {e}")
+            return self.business_info['services']
+    
     def expand_search_terms(self, base_topic: str) -> List[str]:
         """Espande i termini di ricerca con sinonimi e contesti"""
         expanded_terms = [base_topic]
@@ -196,7 +228,7 @@ class RedditAIBusinessScraper:
             return []
     
     def search_reddit_globally(self, search_terms: List[str], time_filter: str = 'month', 
-                             limit_per_term: int = 50) -> List[Dict]:
+                             limit_per_term: int = 50, use_ai_expansion: bool = True) -> List[Dict]:
         """Ricerca globale su tutto Reddit per ogni termine"""
         all_posts = []
         processed_ids = set()
@@ -328,7 +360,7 @@ class RedditAIBusinessScraper:
         return opportunities
     
     def _evaluate_single_post_ai(self, post: Dict) -> Dict:
-        """Valuta un singolo post con AI"""
+        """Valuta un singolo post con AI - versione più stringente"""
         try:
             # Estrai primi commenti se disponibili
             comments_context = ""
@@ -342,7 +374,7 @@ class RedditAIBusinessScraper:
                     pass
             
             prompt = f"""
-            Analizza in modo approfondito questa conversazione Reddit per identificare se rappresenta un'opportunità concreta di fornire valore aggiunto, basandoti sul contesto business fornito.
+            Analizza con CRITERI MOLTO STRINGENTI questa conversazione Reddit per identificare se rappresenta un'opportunità CONCRETA di fornire valore aggiunto senza apparire promozionali.
             
             CONTESTO BUSINESS:
             Brand: {self.business_info['brand_name']}
@@ -355,27 +387,44 @@ class RedditAIBusinessScraper:
             Commenti: {post['num_comments']} commenti
             Top commenti: {comments_context}
             
-            ISTRUZIONI DI VALUTAZIONE:
-            1. Identifica se la conversazione contiene una domanda specifica o un problema rilevante, per il quale possiamo fornire consigli o soluzioni autentiche basate sulla nostra competenza approfondita (evitando qualsiasi approccio promozionale o spam).
-            2. Valuta la pertinenza dei nostri servizi nel contesto della discussione, considerando se il nostro intervento può risultare naturale, utile e contestualizzato.
-            3. Determina se è possibile apportare un contributo significativo e informativo senza risultare invadenti o commerciali, favorendo un coinvolgimento genuino e costruttivo.
+            CRITERI STRINGENTI (DEVE SODDISFARE TUTTI):
+            1. DOMANDA SPECIFICA: C'è una domanda diretta e specifica che richiede expertise professionale?
+            2. COMPETENZA RILEVANTE: La nostra competenza è direttamente applicabile al problema?
+            3. VALORE AUTENTICO: Possiamo fornire un consiglio genuino e non promozionale?
+            4. CONTESTO APPROPRIATO: Il nostro intervento sarà ben accolto dalla community?
+            5. CONVERSAZIONE ATTIVA: Ci sono già altre risposte o la discussione è attiva?
+            6. AUTORITÀ NATURALE: Il nostro intervento può posizionarci naturalmente come esperti?
             
-            OBIETTIVO: Garantire un'analisi critica, contestualizzata e mirata a identificare spazi di interazione costruttiva su Reddit, volta a valorizzare il brand rispettando le dinamiche della community e massimizzando l'impatto positivo.
+            ESCLUDI IMMEDIATAMENTE SE:
+            - Post troppo generici o vaghi
+            - Già troppe risposte di esperti
+            - Tono ostile o controverso
+            - Contenuto non professionale
+            - Domanda già risolta nei commenti
+            - Richiede competenze che non abbiamo
+            
+            PUNTEGGIO:
+            - 80-100: Opportunità eccellente, intervento altamente raccomandato
+            - 60-79: Buona opportunità, intervento raccomandato
+            - 50-59: Opportunità marginale, valutare attentamente
+            - <50: Sconsigliato, filtrare
             
             Rispondi in formato JSON:
             {{
                 "has_opportunity": true/false,
                 "relevance_score": 0-100,
-                "reason": "breve spiegazione",
-                "response_angle": "suggerimento su come rispondere se opportunità"
+                "reason": "analisi dettagliata dei criteri",
+                "response_angle": "approccio specifico raccomandato",
+                "intervention_type": "educational/consultative/supportive",
+                "urgency": "high/medium/low"
             }}
             """
             
             response = self.client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0.3
+                max_tokens=300,
+                temperature=0.2  # Più deterministico per criteri stringenti
             )
             
             # Parse della risposta
@@ -387,11 +436,17 @@ class RedditAIBusinessScraper:
             except:
                 # Fallback se non è JSON valido
                 result = {
-                    "has_opportunity": "true" in result_text.lower(),
-                    "relevance_score": 50,
-                    "reason": result_text[:100],
-                    "response_angle": ""
+                    "has_opportunity": "true" in result_text.lower() and "high" in result_text.lower(),
+                    "relevance_score": 30,  # Score basso di default per fallback
+                    "reason": result_text[:150],
+                    "response_angle": "",
+                    "intervention_type": "educational",
+                    "urgency": "low"
                 }
+            
+            # Applica filtro stringente: solo score >= 50
+            if result.get("relevance_score", 0) < 50:
+                result["has_opportunity"] = False
             
             return result
             
@@ -401,7 +456,9 @@ class RedditAIBusinessScraper:
                 "has_opportunity": False,
                 "relevance_score": 0,
                 "reason": "Errore valutazione",
-                "response_angle": ""
+                "response_angle": "",
+                "intervention_type": "none",
+                "urgency": "low"
             }
 
 def create_download_files(opportunities: List[Dict], base_topics: List[str], business_name: str):
@@ -425,7 +482,9 @@ def create_download_files(opportunities: List[Dict], base_topics: List[str], bus
             'is_question': post['is_question'],
             'opportunity_reason': post['ai_opportunity_reason'],
             'suggested_approach': post.get('suggested_response_angle', ''),
-            'search_term': post['search_term']
+            'search_term': post['search_term'],
+            'intervention_type': post.get('intervention_type', ''),
+            'urgency': post.get('urgency', '')
         })
     
     # Ordina per relevance score
@@ -447,6 +506,61 @@ def create_download_files(opportunities: List[Dict], base_topics: List[str], bus
     json_content = json.dumps(json_data, indent=2, ensure_ascii=False, default=str)
     
     return csv_content, json_content, f"{topic_string}_opportunities_{timestamp}"
+
+def analyze_opportunities_trends(opportunities: List[Dict]) -> Dict:
+    """Analizza i trend e pattern nelle opportunità trovate"""
+    if not opportunities:
+        return {}
+    
+    # Analisi argomenti più frequenti
+    all_titles = " ".join([opp['title'].lower() for opp in opportunities])
+    all_content = " ".join([opp['selftext'].lower()[:200] for opp in opportunities if opp['selftext']])
+    
+    # Parole chiave più frequenti (filtrate)
+    import re
+    words = re.findall(r'\b[a-záàéèíìóòúù]{4,}\b', all_titles + " " + all_content)
+    stop_words = {'sono', 'della', 'per', 'con', 'una', 'che', 'più', 'come', 'dove', 'quando', 'cosa', 'qualcuno', 'molto', 'poco', 'tutto', 'anche', 'ancora', 'sempre', 'mai', 'già', 'prima', 'dopo', 'oggi', 'ieri', 'domani'}
+    filtered_words = [w for w in words if w not in stop_words and len(w) > 3]
+    word_freq = Counter(filtered_words)
+    
+    # Subreddit più attivi
+    subreddit_freq = Counter([opp['subreddit'] for opp in opportunities])
+    
+    # Analisi sentiment base
+    question_keywords = ['aiuto', 'problema', 'difficoltà', 'non riesco', 'consiglio', 'dubbio']
+    positive_keywords = ['grazie', 'ottimo', 'perfetto', 'bene', 'soddisfatto']
+    negative_keywords = ['male', 'sbagliato', 'pessimo', 'deluso', 'problema', 'difficoltà']
+    
+    questions_count = sum(1 for opp in opportunities if any(kw in opp['title'].lower() + " " + opp['selftext'].lower() for kw in question_keywords))
+    
+    # Tipi di intervento
+    intervention_types = Counter([opp.get('intervention_type', 'unknown') for opp in opportunities])
+    urgency_levels = Counter([opp.get('urgency', 'unknown') for opp in opportunities])
+    
+    # Score distribution
+    score_ranges = {
+        '90-100%': len([o for o in opportunities if o['ai_relevance_score'] >= 90]),
+        '80-89%': len([o for o in opportunities if 80 <= o['ai_relevance_score'] < 90]),
+        '70-79%': len([o for o in opportunities if 70 <= o['ai_relevance_score'] < 80]),
+        '60-69%': len([o for o in opportunities if 60 <= o['ai_relevance_score'] < 70]),
+        '50-59%': len([o for o in opportunities if 50 <= o['ai_relevance_score'] < 60])
+    }
+    
+    # Timing analysis
+    hours = [opp['created_utc'].hour for opp in opportunities]
+    hour_freq = Counter(hours)
+    
+    return {
+        'top_keywords': word_freq.most_common(10),
+        'top_subreddits': subreddit_freq.most_common(5),
+        'questions_percentage': round((questions_count / len(opportunities)) * 100, 1),
+        'intervention_types': dict(intervention_types),
+        'urgency_levels': dict(urgency_levels),
+        'score_distribution': score_ranges,
+        'peak_hours': hour_freq.most_common(3),
+        'avg_score': round(sum(o['ai_relevance_score'] for o in opportunities) / len(opportunities), 1),
+        'avg_comments': round(sum(o['num_comments'] for o in opportunities) / len(opportunities), 1)
+    }
 
 def main():
     st.title("🤖 Reddit AI Business Scraper")
@@ -491,6 +605,15 @@ def main():
     
     with col2:
         services = st.text_area("📋 Servizi", height=150)
+        if services and st.button("🔧 Ottimizza Servizi con AI"):
+            scraper.business_info['services'] = services
+            with st.spinner("Ottimizzazione servizi..."):
+                optimized_services = scraper._generate_services_optimization()
+                st.success("✅ Servizi ottimizzati!")
+                st.text_area("📋 Servizi Ottimizzati", value=optimized_services, height=150, key="optimized_services")
+                if st.button("✅ Usa Versione Ottimizzata"):
+                    services = optimized_services
+                    st.rerun()
     
     if brand_name and about_us and services:
         scraper.business_info = {
@@ -510,7 +633,7 @@ def main():
     # Configurazione ricerca
     st.header("🎯 Configurazione Ricerca")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         keywords_input = st.text_input(
@@ -532,6 +655,22 @@ def main():
             index=1
         )
     
+    with col3:
+        use_ai_expansion = st.checkbox(
+            "🤖 Espansione AI Keywords",
+            value=True,
+            help="Espande automaticamente le keyword con sinonimi e variazioni usando AI"
+        )
+        
+        relevance_threshold = st.slider(
+            "🎯 Soglia Rilevanza Minima",
+            min_value=50,
+            max_value=90,
+            value=60,
+            step=5,
+            help="Solo opportunità con score >= a questo valore"
+        )
+    
     # Avvia ricerca
     if st.button("🚀 Avvia Ricerca Intelligente", type="primary") and base_topics:
         
@@ -541,28 +680,32 @@ def main():
         
         st.header("📊 Risultati Ricerca")
         
-        # 1. Espansione termini
-        with st.expander("🔍 Espansione termini di ricerca"):
-            all_search_terms = []
-            for topic in base_topics:
-                expanded = scraper.expand_search_terms(topic)
-                all_search_terms.extend(expanded)
-                st.write(f"**{topic}:** {', '.join(expanded[:8])}")
-            
-            # Rimuovi duplicati
-            seen = set()
-            unique_search_terms = []
-            for term in all_search_terms:
-                if term.lower() not in seen:
-                    seen.add(term.lower())
-                    unique_search_terms.append(term)
-            
-            st.info(f"📊 Totale termini unici: {len(unique_search_terms)}")
+        # 1. Espansione termini (opzionale)
+        if use_ai_expansion:
+            with st.expander("🔍 Espansione termini di ricerca"):
+                all_search_terms = []
+                for topic in base_topics:
+                    expanded = scraper.expand_search_terms(topic)
+                    all_search_terms.extend(expanded)
+                    st.write(f"**{topic}:** {', '.join(expanded[:8])}")
+                
+                # Rimuovi duplicati
+                seen = set()
+                unique_search_terms = []
+                for term in all_search_terms:
+                    if term.lower() not in seen:
+                        seen.add(term.lower())
+                        unique_search_terms.append(term)
+                
+                st.info(f"📊 Totale termini unici: {len(unique_search_terms)}")
+        else:
+            unique_search_terms = base_topics
+            st.info(f"🔍 Ricerca diretta per: {', '.join(base_topics)}")
         
         # 2. Ricerca Reddit
         st.subheader("🌐 Ricerca globale su Reddit")
         with st.spinner("Ricerca in corso..."):
-            all_posts = scraper.search_reddit_globally(unique_search_terms, time_filter, limit_per_term=30)
+            all_posts = scraper.search_reddit_globally(unique_search_terms, time_filter, limit_per_term=30, use_ai_expansion=use_ai_expansion)
         
         if not all_posts:
             st.warning("❌ Nessun post trovato!")
@@ -573,34 +716,107 @@ def main():
         # 3. Valutazione AI
         st.subheader("🤖 Analisi AI delle opportunità")
         with st.spinner(f"Analisi di {len(all_posts)} post in corso..."):
-            opportunities = scraper.evaluate_business_relevance_ai(all_posts)
+            all_evaluated = scraper.evaluate_business_relevance_ai(all_posts)
+            # Applica soglia di rilevanza
+            opportunities = [opp for opp in all_evaluated if opp['ai_relevance_score'] >= relevance_threshold]
         
         if not opportunities:
-            st.warning("❌ Nessuna opportunità rilevante trovata")
+            st.warning(f"❌ Nessuna opportunità trovata con score >= {relevance_threshold}%")
+            if all_evaluated:
+                st.info(f"💡 {len(all_evaluated)} post trovati ma filtrati per bassa rilevanza. Prova ad abbassare la soglia.")
             return
         
-        # 4. Risultati
-        st.success(f"✅ TROVATE {len(opportunities)} OPPORTUNITÀ!")
+        # 4. Risultati e Statistiche
+        st.success(f"✅ TROVATE {len(opportunities)} OPPORTUNITÀ QUALIFICATE!")
         
-        # Statistiche
+        # Analisi trend
+        trends = analyze_opportunities_trends(opportunities)
+        
+        # Statistiche principali
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("🎯 Opportunità Totali", len(opportunities))
+            st.metric("🎯 Opportunità Filtrate", len(opportunities))
         
         with col2:
-            high_relevance = len([o for o in opportunities if o['ai_relevance_score'] >= 70])
-            st.metric("🔥 Alta Rilevanza (70%+)", high_relevance)
+            high_relevance = len([o for o in opportunities if o['ai_relevance_score'] >= 80])
+            st.metric("🔥 Score Elevato (80%+)", high_relevance)
         
         with col3:
             questions = len([o for o in opportunities if o['is_question']])
             st.metric("❓ Domande Dirette", questions)
         
         with col4:
-            avg_score = sum(o['ai_relevance_score'] for o in opportunities) / len(opportunities)
-            st.metric("📈 Score Medio", f"{avg_score:.1f}%")
+            st.metric("📈 Score Medio", f"{trends['avg_score']}%")
         
-        # 5. Top opportunità
+        # 5. Recap Analitico
+        st.header("📊 Analisi Approfondita")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🏷️ Argomenti Più Frequenti")
+            if trends['top_keywords']:
+                for word, count in trends['top_keywords']:
+                    percentage = round((count / len(opportunities)) * 100, 1)
+                    st.write(f"• **{word.title()}**: {count} volte ({percentage}%)")
+            
+            st.subheader("📍 Subreddit Più Attivi")
+            if trends['top_subreddits']:
+                for subreddit, count in trends['top_subreddits']:
+                    percentage = round((count / len(opportunities)) * 100, 1)
+                    st.write(f"• **r/{subreddit}**: {count} opportunità ({percentage}%)")
+        
+        with col2:
+            st.subheader("🎯 Distribuzione Score")
+            for range_name, count in trends['score_distribution'].items():
+                if count > 0:
+                    percentage = round((count / len(opportunities)) * 100, 1)
+                    st.write(f"• **{range_name}**: {count} opportunità ({percentage}%)")
+            
+            st.subheader("🕐 Orari di Picco")
+            if trends['peak_hours']:
+                for hour, count in trends['peak_hours']:
+                    st.write(f"• **{hour:02d}:00**: {count} post")
+        
+        # Insight aggiuntivi
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("❓ % Domande", f"{trends['questions_percentage']}%")
+        
+        with col2:
+            st.metric("💬 Commenti Medi", f"{trends['avg_comments']}")
+        
+        with col3:
+            if trends['intervention_types']:
+                most_common_type = max(trends['intervention_types'].items(), key=lambda x: x[1])
+                st.metric("🎯 Tipo Principale", most_common_type[0].title())
+        
+        # 6. Insight Strategici
+        st.subheader("🧠 Insight Strategici")
+        
+        insights = []
+        
+        if trends['questions_percentage'] > 70:
+            insights.append("🎯 **Alto tasso di domande**: Ottima opportunità per posizionarsi come esperti")
+        
+        if trends['avg_score'] > 75:
+            insights.append("⭐ **Score elevato**: Le opportunità identificate sono di alta qualità")
+        
+        if len(trends['top_subreddits']) <= 2:
+            insights.append("📍 **Concentrazione geografica**: Focus su pochi subreddit specifici")
+        
+        if any(hour < 9 or hour > 18 for hour, _ in trends['peak_hours']):
+            insights.append("🕐 **Attività fuori orario**: Molte discussioni avvengono la sera/notte")
+        
+        if trends.get('urgency_levels', {}).get('high', 0) > len(opportunities) * 0.3:
+            insights.append("🚨 **Urgenza elevata**: Molte opportunità richiedono intervento rapido")
+        
+        for insight in insights:
+            st.info(insight)
+        
+        # 7. Top opportunità dettagliate
         st.subheader("🏆 Top Opportunità")
         
         for i, opp in enumerate(sorted(opportunities, key=lambda x: x['ai_relevance_score'], reverse=True)[:10], 1):
@@ -612,6 +828,13 @@ def main():
                     st.write(f"**📍 Subreddit:** r/{opp['subreddit']}")
                     st.write(f"**👤 Autore:** {opp['author']}")
                     st.write(f"**🔍 Trovato con:** {opp['search_term']}")
+                    
+                    # Nuovi campi
+                    if opp.get('intervention_type'):
+                        st.write(f"**🎯 Tipo Intervento:** {opp['intervention_type'].title()}")
+                    if opp.get('urgency'):
+                        urgency_emoji = {'high': '🚨', 'medium': '⚠️', 'low': '📝'}.get(opp['urgency'], '📝')
+                        st.write(f"**⏰ Urgenza:** {urgency_emoji} {opp['urgency'].title()}")
                     
                     if opp['selftext']:
                         st.write("**📝 Contenuto:**")
@@ -631,7 +854,7 @@ def main():
                 
                 st.markdown(f"[🔗 Vai al post Reddit]({opp['reddit_url']})")
         
-        # 6. Download files
+        # 8. Download files
         st.subheader("💾 Download Risultati")
         
         csv_content, json_content, filename_base = create_download_files(opportunities, base_topics, brand_name)
