@@ -112,14 +112,14 @@ class RedditAIBusinessScraper:
         """Genera una value proposition usando AI basata su chi siamo e servizi"""
         try:
             prompt = f"""
-            Basandoti su queste informazioni aziendali, genera una breve value proposition 
+            Basandoti su queste informazioni aziendali, genera una dettagliata value proposition 
             che riassuma in che modo questa azienda può aiutare le persone:
             
             Chi siamo: {self.business_info['about_us']}
             
             Servizi: {self.business_info['services']}
             
-            Genera una value proposition di massimo 3 righe che evidenzi:
+            Genera una value proposition di massimo 5 righe che evidenzi:
             1. Quali problemi risolve
             2. A chi si rivolge
             3. Qual è il valore unico che offre
@@ -374,7 +374,7 @@ class RedditAIBusinessScraper:
                     pass
             
             prompt = f"""
-            Analizza con CRITERI MOLTO STRINGENTI questa conversazione Reddit per identificare se rappresenta un'opportunità CONCRETA di fornire valore aggiunto senza apparire promozionali.
+            Analizza con CRITERI MOLTO STRINGENTI questa conversazione Reddit per identificare se rappresenta un'opportunità CONCRETA di fornire valore aggiunto senza apparire promozionali e potendo parlare dei servizi offerti dall'azienda in modo che sia naturale.
             
             CONTESTO BUSINESS:
             Brand: {self.business_info['brand_name']}
@@ -397,6 +397,8 @@ class RedditAIBusinessScraper:
             
             ESCLUDI IMMEDIATAMENTE SE:
             - Post troppo generici o vaghi
+            - Domande fuori contesto
+            - Sfoghi o problemi personali troppo sensibili
             - Già troppe risposte di esperti
             - Tono ostile o controverso
             - Contenuto non professionale
