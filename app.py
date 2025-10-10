@@ -9,61 +9,249 @@ import logging
 from collections import Counter
 import re
 from openai import OpenAI
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict, Set, Tuple, Optional
 import io
 import base64
 import zipfile
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+import pickle
+import hashlib
 
 # Configurazione della pagina
 st.set_page_config(
-    page_title="Reddit AI Business Scraper",
-    page_icon="🤖",
+    page_title="Reddit AI Business Scraper - Multi-Language",
+    page_icon="🌍",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Configurazione lingue supportate
+SUPPORTED_LANGUAGES = {
+    'it': {
+        'name': 'Italiano 🇮🇹',
+        'indicators': ['sono', 'è', 'ho', 'hai', 'della', 'nella', 'cosa', 'come', 'quando', 'perché'],
+        'help_patterns': [r'\?', r'aiuto', r'consiglio', r'qualcuno', r'come posso', r'problema'],
+        'subreddits': ['italy', 'italyinformatica', 'commercialisti', 'economia', 'finanza']
+    },
+    'en': {
+        'name': 'English 🇬🇧',
+        'indicators': ['the', 'is', 'are', 'have', 'has', 'what', 'when', 'where', 'why', 'how'],
+        'help_patterns': [r'\?', r'help', r'advice', r'anyone', r'how can', r'problem', r'issue'],
+        'subreddits': ['business', 'entrepreneur', 'smallbusiness', 'finance', 'personalfinance']
+    },
+    'es': {
+        'name': 'Español 🇪🇸',
+        'indicators': ['es', 'está', 'son', 'tiene', 'qué', 'cuando', 'donde', 'por qué', 'cómo'],
+        'help_patterns': [r'\?', r'ayuda', r'consejo', r'alguien', r'cómo puedo', r'problema'],
+        'subreddits': ['spain', 'espanol', 'negocios', 'finanzas', 'emprendedores']
+    },
+    'fr': {
+        'name': 'Français 🇫🇷',
+        'indicators': ['le', 'la', 'est', 'sont', 'avoir', 'que', 'quand', 'où', 'pourquoi', 'comment'],
+        'help_patterns': [r'\?', r'aide', r'conseil', r'quelqu\'un', r'comment', r'problème'],
+        'subreddits': ['france', 'vosfinances', 'conseiljuridique', 'entreprise']
+    },
+    'de': {
+        'name': 'Deutsch 🇩🇪',
+        'indicators': ['der', 'die', 'das', 'ist', 'sind', 'haben', 'was', 'wann', 'wo', 'warum'],
+        'help_patterns': [r'\?', r'hilfe', r'rat', r'jemand', r'wie kann', r'problem'],
+        'subreddits': ['de', 'finanzen', 'selbststaendig', 'wirtschaft']
+    }
+}
+
+class SessionLogger:
+    """Gestisce il logging delle sessioni in un formato strutturato"""
+    
+    def __init__(self):
+        self.log_file = "reddit_scraper_sessions.json"
+        self.current_session = {
+            'session_id': hashlib.md5(str(datetime.now()).encode()).hexdigest()[:8],
+            'start_time': datetime.now().isoformat(),
+            'end_time': None,
+            'language': None,
+            'keywords': [],
+            'posts_found': 0,
+            'opportunities_identified': 0,
+            'errors': [],
+            'filters_applied': {},
+            'execution_time_seconds': 0
+        }
+    
+    def update_session(self, **kwargs):
+        """Aggiorna i dati della sessione corrente"""
+        for key, value in kwargs.items():
+            if key in self.current_session:
+                self.current_session[key] = value
+    
+    def log_error(self, error_msg: str):
+        """Registra un errore nella sessione"""
+        self.current_session['errors'].append({
+            'time': datetime.now().isoformat(),
+            'message': str(error_msg)
+        })
+    
+    def save_session(self):
+        """Salva la sessione corrente nel file di log"""
+        try:
+            # Calcola tempo di esecuzione
+            if self.current_session['start_time']:
+                start = datetime.fromisoformat(self.current_session['start_time'])
+                self.current_session['execution_time_seconds'] = (datetime.now() - start).total_seconds()
+            
+            self.current_session['end_time'] = datetime.now().isoformat()
+            
+            # Carica log esistente o crea nuovo
+            try:
+                with open(self.log_file, 'r') as f:
+                    logs = json.load(f)
+            except:
+                logs = []
+            
+            # Aggiungi sessione corrente
+            logs.append(self.current_session)
+            
+            # Salva
+            with open(self.log_file, 'w') as f:
+                json.dump(logs, f, indent=2)
+            
+            return True
+        except Exception as e:
+            st.error(f"Errore salvataggio log: {e}")
+            return False
+    
+    def export_to_excel(self) -> bytes:
+        """Esporta i log in formato Excel"""
+        try:
+            with open(self.log_file, 'r') as f:
+                logs = json.load(f)
+            
+            # Converti in DataFrame
+            df_data = []
+            for log in logs:
+                df_data.append({
+                    'Session ID': log.get('session_id', ''),
+                    'Start Time': log.get('start_time', ''),
+                    'End Time': log.get('end_time', ''),
+                    'Language': log.get('language', ''),
+                    'Keywords': ', '.join(log.get('keywords', [])),
+                    'Posts Found': log.get('posts_found', 0),
+                    'Opportunities': log.get('opportunities_identified', 0),
+                    'Execution Time (s)': log.get('execution_time_seconds', 0),
+                    'Errors Count': len(log.get('errors', []))
+                })
+            
+            df = pd.DataFrame(df_data)
+            
+            # Crea Excel
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Sessions Log', index=False)
+            
+            return output.getvalue()
+            
+        except Exception as e:
+            st.error(f"Errore export Excel log: {e}")
+            return None
+
+class CheckpointManager:
+    """Gestisce checkpoint e recupero dello stato"""
+    
+    def __init__(self):
+        self.checkpoint_dir = "checkpoints"
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.checkpoint_file = None
+    
+    def create_checkpoint(self, data: Dict, checkpoint_name: str = None):
+        """Crea un checkpoint dello stato corrente"""
+        try:
+            if not checkpoint_name:
+                checkpoint_name = f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            self.checkpoint_file = os.path.join(self.checkpoint_dir, f"{checkpoint_name}.pkl")
+            
+            with open(self.checkpoint_file, 'wb') as f:
+                pickle.dump(data, f)
+            
+            return True
+        except Exception as e:
+            st.error(f"Errore creazione checkpoint: {e}")
+            return False
+    
+    def load_checkpoint(self, checkpoint_file: str) -> Optional[Dict]:
+        """Carica un checkpoint salvato"""
+        try:
+            filepath = os.path.join(self.checkpoint_dir, checkpoint_file)
+            with open(filepath, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            st.error(f"Errore caricamento checkpoint: {e}")
+            return None
+    
+    def list_checkpoints(self) -> List[str]:
+        """Elenca tutti i checkpoint disponibili"""
+        try:
+            return [f for f in os.listdir(self.checkpoint_dir) if f.endswith('.pkl')]
+        except:
+            return []
+    
+    def delete_checkpoint(self, checkpoint_file: str):
+        """Elimina un checkpoint"""
+        try:
+            filepath = os.path.join(self.checkpoint_dir, checkpoint_file)
+            os.remove(filepath)
+            return True
+        except:
+            return False
+
 class MultiAgentEvaluator:
     """Sistema multi-agente per valutazione approfondita dei post"""
     
-    def __init__(self, client: OpenAI, business_info: Dict):
+    def __init__(self, client: OpenAI, business_info: Dict, language: str = 'it'):
         self.client = client
         self.business_info = business_info
+        self.language = language
         self.logger = logging.getLogger(__name__)
+        self.timeout_seconds = 30  # Timeout per chiamata AI
     
     def agent_sensitivity_filter(self, post: Dict) -> Dict:
         """Agente 1: Filtra contenuti sensibili o inappropriati"""
         try:
+            # Adatta il prompt alla lingua
+            lang_instruction = f"Analyze this post in {SUPPORTED_LANGUAGES[self.language]['name']} language."
+            
             prompt = f"""
-            Sei un esperto di reputazione aziendale e comunicazione sensibile.
-            Analizza questo post Reddit per identificare se contiene elementi che renderebbero 
-            inappropriato o rischioso un intervento aziendale.
+            You are an expert in corporate reputation and sensitive communication.
+            {lang_instruction}
+            Analyze this Reddit post to identify if it contains elements that would make 
+            a business intervention inappropriate or risky.
             
             POST:
-            Titolo: {post['title']}
-            Contenuto: {post['selftext'][:1000]}
+            Title: {post['title']}
+            Content: {post['selftext'][:1000]}
             
-            CRITERI DI ESCLUSIONE IMMEDIATA:
-            1. LUTTO/MORTE: Menzioni di morte, lutto, malattie terminali
-            2. SALUTE MENTALE GRAVE: Depressione severa, pensieri suicidi, crisi psicologiche
-            3. CONTROVERSIE: Discussioni politiche, religiose, etiche divisive
-            4. LAMENTELE/SFOGHI: Rant contro aziende, servizi, professionisti
-            5. SITUAZIONI PERSONALI DELICATE: Divorzi, violenze, abusi, problemi familiari gravi
-            6. CONTENUTO ILLEGALE: Discussioni su attività illegali o al limite
-            7. TONO AGGRESSIVO: Linguaggio offensivo, flame war, trolling
-            8. PROBLEMI FINANZIARI GRAVI: Bancarotta, debiti insostenibili, disperazione economica
-            9. DISCRIMINAZIONE: Qualsiasi forma di discriminazione o pregiudizio
-            10. MINORI: Situazioni che coinvolgono minori in contesti delicati
+            IMMEDIATE EXCLUSION CRITERIA:
+            1. DEATH/MOURNING: Mentions of death, mourning, terminal illnesses
+            2. SEVERE MENTAL HEALTH: Severe depression, suicidal thoughts, psychological crises
+            3. CONTROVERSIES: Divisive political, religious, ethical discussions
+            4. COMPLAINTS/RANTS: Rants against companies, services, professionals
+            5. DELICATE PERSONAL SITUATIONS: Divorces, violence, abuse, serious family problems
+            6. ILLEGAL CONTENT: Discussions about illegal or borderline activities
+            7. AGGRESSIVE TONE: Offensive language, flame wars, trolling
+            8. SERIOUS FINANCIAL PROBLEMS: Bankruptcy, unsustainable debts, economic desperation
+            9. DISCRIMINATION: Any form of discrimination or prejudice
+            10. MINORS: Situations involving minors in sensitive contexts
             
-            VALUTA ANCHE:
-            - Il tono generale è costruttivo o distruttivo?
-            - C'è spazio per un intervento professionale senza sembrare opportunisti?
-            - Il contesto emotivo permetterebbe un intervento aziendale rispettoso?
+            ALSO EVALUATE:
+            - Is the general tone constructive or destructive?
+            - Is there room for professional intervention without appearing opportunistic?
+            - Would the emotional context allow for respectful business intervention?
             
-            Rispondi SOLO in JSON:
+            Reply ONLY in JSON:
             {{
                 "is_sensitive": true/false,
-                "sensitivity_score": 0-100 (100 = estremamente sensibile),
-                "sensitivity_reasons": ["lista di motivi specifici"],
+                "sensitivity_score": 0-100 (100 = extremely sensitive),
+                "sensitivity_reasons": ["list of specific reasons"],
                 "intervention_risk": "high/medium/low",
                 "can_proceed": true/false
             }}
@@ -73,7 +261,8 @@ class MultiAgentEvaluator:
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=200,
-                temperature=0.1
+                temperature=0.1,
+                timeout=self.timeout_seconds
             )
             
             result_text = response.choices[0].message.content.strip()
@@ -81,11 +270,10 @@ class MultiAgentEvaluator:
             try:
                 result = json.loads(result_text)
             except:
-                # Fallback conservativo in caso di errore parsing
                 result = {
                     "is_sensitive": True,
                     "sensitivity_score": 100,
-                    "sensitivity_reasons": ["Errore valutazione"],
+                    "sensitivity_reasons": ["Parse error"],
                     "intervention_risk": "high",
                     "can_proceed": False
                 }
@@ -93,11 +281,11 @@ class MultiAgentEvaluator:
             return result
             
         except Exception as e:
-            self.logger.error(f"Errore agent_sensitivity_filter: {e}")
+            self.logger.error(f"Error agent_sensitivity_filter: {e}")
             return {
                 "is_sensitive": True,
                 "sensitivity_score": 100,
-                "sensitivity_reasons": ["Errore sistema"],
+                "sensitivity_reasons": ["System error"],
                 "intervention_risk": "high",
                 "can_proceed": False
             }
@@ -105,44 +293,47 @@ class MultiAgentEvaluator:
     def agent_business_relevance(self, post: Dict) -> Dict:
         """Agente 2: Valuta la rilevanza per il business specifico"""
         try:
+            lang_instruction = f"Analyze in {SUPPORTED_LANGUAGES[self.language]['name']} language."
+            
             prompt = f"""
-            Sei un esperto di business development e marketing strategico.
-            Valuta se questo post rappresenta un'opportunità reale per il business.
+            You are an expert in business development and strategic marketing.
+            {lang_instruction}
+            Evaluate if this post represents a real opportunity for the business.
             
             BUSINESS CONTEXT:
             Brand: {self.business_info['brand_name']}
-            Servizi: {self.business_info['services'][:500]}
+            Services: {self.business_info['services'][:500]}
             Value Proposition: {self.business_info.get('value_proposition', '')[:300]}
             
             POST:
-            Titolo: {post['title']}
-            Contenuto: {post['selftext'][:800]}
+            Title: {post['title']}
+            Content: {post['selftext'][:800]}
             Subreddit: r/{post['subreddit']}
-            Commenti: {post['num_comments']}
+            Comments: {post['num_comments']}
             
-            CRITERI DI VALUTAZIONE:
-            1. ALLINEAMENTO SERVIZI: I nostri servizi risolvono direttamente il problema?
-            2. TARGET AUDIENCE: L'autore è nel nostro target di clienti?
-            3. STADIO DEL PROBLEMA: È nella fase giusta per il nostro intervento?
-            4. COMPETENZA DIMOSTRATA: Possiamo dimostrare expertise specifica?
-            5. VALORE AGGIUNTO: Possiamo offrire insights unici non già presenti nei commenti?
-            6. TIMING: È il momento giusto per intervenire (non troppo tardi)?
-            7. ROI POTENZIALE: Vale la pena investire tempo in questa conversazione?
+            EVALUATION CRITERIA:
+            1. SERVICE ALIGNMENT: Do our services directly solve the problem?
+            2. TARGET AUDIENCE: Is the author in our target customer base?
+            3. PROBLEM STAGE: Is it at the right stage for our intervention?
+            4. DEMONSTRATED EXPERTISE: Can we demonstrate specific expertise?
+            5. ADDED VALUE: Can we offer unique insights not already in comments?
+            6. TIMING: Is it the right time to intervene (not too late)?
+            7. POTENTIAL ROI: Is it worth investing time in this conversation?
             
-            ESCLUDI SE:
-            - Il problema è già risolto
-            - Richiede competenze che non abbiamo
-            - È una discussione teorica senza bisogno pratico
-            - L'autore non sembra aperto a suggerimenti
-            - È troppo generico o vago
+            EXCLUDE IF:
+            - The problem is already solved
+            - Requires skills we don't have
+            - It's a theoretical discussion without practical need
+            - The author doesn't seem open to suggestions
+            - It's too generic or vague
             
-            Rispondi SOLO in JSON:
+            Reply ONLY in JSON:
             {{
                 "business_alignment_score": 0-100,
                 "is_target_audience": true/false,
                 "problem_stage": "awareness/consideration/decision/solved",
-                "value_we_can_add": "descrizione specifica",
-                "competitive_advantage": "cosa ci distingue in questo caso",
+                "value_we_can_add": "specific description",
+                "competitive_advantage": "what distinguishes us in this case",
                 "should_engage": true/false
             }}
             """
@@ -151,7 +342,8 @@ class MultiAgentEvaluator:
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=250,
-                temperature=0.2
+                temperature=0.2,
+                timeout=self.timeout_seconds
             )
             
             result_text = response.choices[0].message.content.strip()
@@ -171,7 +363,7 @@ class MultiAgentEvaluator:
             return result
             
         except Exception as e:
-            self.logger.error(f"Errore agent_business_relevance: {e}")
+            self.logger.error(f"Error agent_business_relevance: {e}")
             return {
                 "business_alignment_score": 0,
                 "is_target_audience": False,
@@ -184,40 +376,43 @@ class MultiAgentEvaluator:
     def agent_engagement_strategy(self, post: Dict, sensitivity_result: Dict, business_result: Dict) -> Dict:
         """Agente 3: Definisce la strategia di engagement ottimale"""
         try:
+            lang_instruction = f"Provide strategy for {SUPPORTED_LANGUAGES[self.language]['name']} market."
+            
             prompt = f"""
-            Sei un esperto di community management e brand reputation.
-            Basandoti sulle analisi precedenti, definisci la strategia di engagement.
+            You are an expert in community management and brand reputation.
+            {lang_instruction}
+            Based on previous analyses, define the engagement strategy.
             
             POST SUMMARY:
-            Titolo: {post['title']}
-            Score Reddit: {post['score']}
-            Commenti: {post['num_comments']}
-            È una domanda: {post.get('is_question', False)}
+            Title: {post['title']}
+            Reddit Score: {post['score']}
+            Comments: {post['num_comments']}
+            Is question: {post.get('is_question', False)}
             
-            ANALISI SENSIBILITÀ:
-            Sensibilità: {sensitivity_result.get('sensitivity_score', 100)}/100
-            Rischio: {sensitivity_result.get('intervention_risk', 'high')}
+            SENSITIVITY ANALYSIS:
+            Sensitivity: {sensitivity_result.get('sensitivity_score', 100)}/100
+            Risk: {sensitivity_result.get('intervention_risk', 'high')}
             
-            ANALISI BUSINESS:
-            Allineamento: {business_result.get('business_alignment_score', 0)}/100
+            BUSINESS ANALYSIS:
+            Alignment: {business_result.get('business_alignment_score', 0)}/100
             Target: {business_result.get('is_target_audience', False)}
-            Fase: {business_result.get('problem_stage', 'unknown')}
+            Stage: {business_result.get('problem_stage', 'unknown')}
             
-            DEFINISCI:
-            1. APPROCCIO: Come dovremmo rispondere (educativo, consultivo, supportivo)?
-            2. TONO: Quale tono usare (professionale, amichevole, empatico)?
-            3. CONTENUTO: Cosa includere/escludere nella risposta
-            4. CTA: Quale call-to-action (se appropriata)
-            5. RISCHI: Quali rischi monitorare
-            6. PRIORITÀ: Quanto è prioritaria questa opportunità (1-10)
+            DEFINE:
+            1. APPROACH: How should we respond (educational, consultative, supportive)?
+            2. TONE: What tone to use (professional, friendly, empathetic)?
+            3. CONTENT: What to include/exclude in the response
+            4. CTA: What call-to-action (if appropriate)
+            5. RISKS: What risks to monitor
+            6. PRIORITY: How priority is this opportunity (1-10)
             
-            Rispondi SOLO in JSON:
+            Reply ONLY in JSON:
             {{
                 "engagement_approach": "educational/consultative/supportive/none",
-                "recommended_tone": "descrizione del tono",
-                "key_points_to_address": ["punto 1", "punto 2"],
-                "avoid_mentioning": ["cosa non dire"],
-                "suggested_cta": "call to action se appropriata",
+                "recommended_tone": "tone description",
+                "key_points_to_address": ["point 1", "point 2"],
+                "avoid_mentioning": ["what not to say"],
+                "suggested_cta": "call to action if appropriate",
                 "priority_score": 1-10,
                 "estimated_impact": "high/medium/low",
                 "final_recommendation": "ENGAGE/SKIP/MONITOR"
@@ -228,7 +423,8 @@ class MultiAgentEvaluator:
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=300,
-                temperature=0.2
+                temperature=0.2,
+                timeout=self.timeout_seconds
             )
             
             result_text = response.choices[0].message.content.strip()
@@ -250,7 +446,7 @@ class MultiAgentEvaluator:
             return result
             
         except Exception as e:
-            self.logger.error(f"Errore agent_engagement_strategy: {e}")
+            self.logger.error(f"Error agent_engagement_strategy: {e}")
             return {
                 "engagement_approach": "none",
                 "recommended_tone": "",
@@ -263,10 +459,20 @@ class MultiAgentEvaluator:
             }
     
     def evaluate_post_complete(self, post: Dict) -> Dict:
-        """Valutazione completa multi-agente del post"""
+        """Valutazione completa multi-agente del post con timeout"""
+        
+        start_time = time.time()
         
         # Step 1: Filtro sensibilità
         sensitivity_result = self.agent_sensitivity_filter(post)
+        
+        # Check timeout
+        if time.time() - start_time > self.timeout_seconds * 3:
+            return {
+                'should_engage': False,
+                'overall_score': 0,
+                'rejection_reason': 'Timeout during evaluation'
+            }
         
         # Se troppo sensibile, skip immediato
         if not sensitivity_result.get('can_proceed', False):
@@ -276,7 +482,7 @@ class MultiAgentEvaluator:
                 'sensitivity_score': sensitivity_result.get('sensitivity_score', 100),
                 'business_alignment_score': 0,
                 'priority_score': 0,
-                'rejection_reason': f"Contenuto sensibile: {', '.join(sensitivity_result.get('sensitivity_reasons', []))}",
+                'rejection_reason': f"Sensitive content: {', '.join(sensitivity_result.get('sensitivity_reasons', []))}",
                 'recommendation': 'SKIP',
                 'details': {
                     'sensitivity': sensitivity_result
@@ -286,6 +492,14 @@ class MultiAgentEvaluator:
         # Step 2: Valutazione business
         business_result = self.agent_business_relevance(post)
         
+        # Check timeout
+        if time.time() - start_time > self.timeout_seconds * 3:
+            return {
+                'should_engage': False,
+                'overall_score': 0,
+                'rejection_reason': 'Timeout during evaluation'
+            }
+        
         # Se non rilevante per il business, skip
         if not business_result.get('should_engage', False):
             return {
@@ -294,7 +508,7 @@ class MultiAgentEvaluator:
                 'sensitivity_score': sensitivity_result.get('sensitivity_score', 0),
                 'business_alignment_score': business_result.get('business_alignment_score', 0),
                 'priority_score': 0,
-                'rejection_reason': 'Non allineato con il business o target',
+                'rejection_reason': 'Not aligned with business or target',
                 'recommendation': 'SKIP',
                 'details': {
                     'sensitivity': sensitivity_result,
@@ -307,7 +521,7 @@ class MultiAgentEvaluator:
         
         # Calcolo score finale ponderato
         overall_score = (
-            (100 - sensitivity_result.get('sensitivity_score', 0)) * 0.3 +  # Meno sensibile = meglio
+            (100 - sensitivity_result.get('sensitivity_score', 0)) * 0.3 +
             business_result.get('business_alignment_score', 0) * 0.4 +
             engagement_result.get('priority_score', 0) * 10 * 0.3
         )
@@ -342,19 +556,25 @@ class MultiAgentEvaluator:
 
 
 class RedditAIBusinessScraper:
-    def __init__(self):
+    def __init__(self, language: str = 'it'):
         """Inizializza il scraper Reddit con AI"""
         
-        # Setup logging per Streamlit
+        # Setup logging
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
         
-        # Inizializza Reddit se le credenziali sono disponibili
+        # Language configuration
+        self.language = language
+        self.language_config = SUPPORTED_LANGUAGES[language]
+        
+        # Initialize components
         self.reddit = None
         self.client = None
         self.multi_agent = None
+        self.session_logger = SessionLogger()
+        self.checkpoint_manager = CheckpointManager()
         
-        # Informazioni business (verranno popolate dall'utente)
+        # Business info
         self.business_info = {
             'brand_name': '',
             'about_us': '',
@@ -362,49 +582,9 @@ class RedditAIBusinessScraper:
             'value_proposition': ''
         }
         
-        # Espansione termini di ricerca italiani
-        self.search_expansions = {
-            'mutuo': {
-                'sinonimi': ['mutui', 'finanziamento', 'finanziamenti', 'prestito', 'prestiti', 
-                            'credito', 'ipoteca', 'ipoteche', 'mutuo casa', 'mutuo prima casa'],
-                'contesti': ['banca', 'banche', 'tasso', 'tassi', 'spread', 'rata', 'rate', 
-                            'surroga', 'surroghe', 'broker', 'consulente', 'taeg', 'tan', 
-                            'piano ammortamento', 'rogito', 'notaio', 'perizia'],
-                'problemi': ['rifiutato', 'negato', 'problemi', 'difficoltà', 'aiuto', 'consiglio',
-                            'non riesco', 'bocciato', 'respinto', 'documenti', 'garanzie']
-            },
-            'casa': {
-                'sinonimi': ['case', 'abitazione', 'abitazioni', 'immobile', 'immobili', 
-                           'appartamento', 'appartamenti', 'villa', 'ville', 'bilocale', 'trilocale'],
-                'contesti': ['acquisto', 'acquistare', 'comprare', 'vendita', 'vendere', 
-                           'affitto', 'affittare', 'agenzia', 'agente immobiliare', 'ristrutturazione',
-                           'ristrutturare', 'classe energetica', 'catasto'],
-                'problemi': ['cerco', 'cercando', 'trovare', 'budget', 'prezzi', 'mercato',
-                           'valutazione', 'perizia', 'compromesso', 'proposta']
-            },
-            'investimento': {
-                'sinonimi': ['investimenti', 'investire', 'portafoglio', 'rendita', 'rendimento'],
-                'contesti': ['immobiliare', 'mattone', 'locazione', 'airbnb', 'affitti brevi',
-                           'rivalutazione', 'plusvalenza', 'tasse', 'imu', 'cedolare secca'],
-                'problemi': ['conviene', 'meglio', 'consiglio', 'strategia', 'rischio', 'rendimento']
-            }
-        }
-        
-        # Pattern per identificare domande e richieste di aiuto
-        self.help_patterns = [
-            r'\?',  # Domande
-            r'(aiuto|aiutatemi|help)',
-            r'(consiglio|consigli|suggerimento)',
-            r'(qualcuno sa|qualcuno ha|qualcuno può)',
-            r'(come posso|come fare|come si fa)',
-            r'(cosa ne pensate|che ne pensate|opinioni)',
-            r'(conviene|meglio|preferibile)',
-            r'(problema|problemi|difficoltà)',
-            r'(non so|non riesco|non capisco)',
-            r'(cercando|cerco|in cerca di)',
-            r'(esperienza|esperienze)',
-            r'(dubbio|dubbi|incerto)'
-        ]
+        # Timeout settings
+        self.search_timeout = 60  # secondi per ricerca
+        self.evaluation_timeout = 120  # secondi per valutazione
     
     def initialize_apis(self, reddit_client_id, reddit_client_secret, reddit_user_agent, openai_api_key):
         """Inizializza le API con le credenziali fornite"""
@@ -414,185 +594,31 @@ class RedditAIBusinessScraper:
                 client_secret=reddit_client_secret,
                 user_agent=reddit_user_agent
             )
-            st.success("✅ Reddit API configurato")
+            st.success("✅ Reddit API configured")
         except Exception as e:
-            st.error(f"❌ Errore Reddit API: {e}")
+            st.error(f"❌ Reddit API Error: {e}")
+            self.session_logger.log_error(f"Reddit API initialization failed: {e}")
             return False
         
         try:
             self.client = OpenAI(api_key=openai_api_key)
-            # Inizializza il sistema multi-agente
-            self.multi_agent = MultiAgentEvaluator(self.client, self.business_info)
-            st.success("✅ OpenAI API e Multi-Agent System configurati")
+            self.multi_agent = MultiAgentEvaluator(self.client, self.business_info, self.language)
+            st.success("✅ OpenAI API and Multi-Agent System configured")
         except Exception as e:
-            st.error(f"❌ Errore OpenAI API: {e}")
+            st.error(f"❌ OpenAI API Error: {e}")
+            self.session_logger.log_error(f"OpenAI API initialization failed: {e}")
             return False
         
         return True
     
-    def _generate_value_proposition(self):
-        """Genera una value proposition usando AI basata su chi siamo e servizi"""
-        try:
-            prompt = f"""
-            Basandoti su queste informazioni aziendali, genera una dettagliata value proposition 
-            che riassuma in che modo questa azienda può aiutare le persone:
-            
-            Chi siamo: {self.business_info['about_us']}
-            
-            Servizi: {self.business_info['services']}
-            
-            Genera una value proposition di massimo 5 righe che evidenzi:
-            1. Quali problemi risolve
-            2. A chi si rivolge
-            3. Qual è il valore unico che offre
-            """
-            
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0.3
-            )
-            
-            self.business_info['value_proposition'] = response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            self.logger.error(f"Errore generazione value proposition: {e}")
-            self.business_info['value_proposition'] = "Aiutiamo i clienti con soluzioni professionali"
-    
-    def expand_search_terms(self, base_topic: str) -> List[str]:
-        """Espande i termini di ricerca con sinonimi e contesti"""
-        expanded_terms = [base_topic]
-        base_lower = base_topic.lower()
-        
-        # Cerca espansioni predefinite
-        for key, expansions in self.search_expansions.items():
-            if key in base_lower or base_lower in key:
-                expanded_terms.extend(expansions['sinonimi'])
-                # Aggiungi combinazioni con contesti
-                for context in expansions['contesti'][:5]:  # Limita per non esagerare
-                    expanded_terms.append(f"{base_topic} {context}")
-                # Aggiungi problemi comuni
-                for problem in expansions['problemi'][:3]:
-                    expanded_terms.append(f"{problem} {base_topic}")
-                break
-        
-        # Genera anche variazioni con AI
-        try:
-            ai_expansions = self._generate_search_variations_ai(base_topic)
-            expanded_terms.extend(ai_expansions)
-        except:
-            pass
-        
-        # Rimuovi duplicati mantenendo l'ordine
-        seen = set()
-        unique_terms = []
-        for term in expanded_terms:
-            if term.lower() not in seen:
-                seen.add(term.lower())
-                unique_terms.append(term)
-        
-        return unique_terms[:15]  # Massimo 15 termini
-    
-    def _generate_search_variations_ai(self, topic: str) -> List[str]:
-        """Usa AI per generare variazioni di ricerca"""
-        try:
-            prompt = f"""
-            Genera 5 variazioni in italiano del termine di ricerca "{topic}" per Reddit.
-            Include sinonimi, forme plurali, e frasi correlate che le persone userebbero.
-            Rispondi solo con i termini separati da virgola, senza numerazione.
-            """
-            
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
-                temperature=0.5
-            )
-            
-            variations = response.choices[0].message.content.strip().split(',')
-            return [v.strip() for v in variations if v.strip()][:5]
-            
-        except Exception as e:
-            self.logger.error(f"Errore generazione variazioni AI: {e}")
-            return []
-    
-    def search_reddit_globally(self, search_terms: List[str], time_filter: str = 'month', 
-                             limit_per_term: int = 50) -> List[Dict]:
-        """Ricerca globale su tutto Reddit per ogni termine"""
-        all_posts = []
-        processed_ids = set()
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for i, term in enumerate(search_terms):
-            status_text.text(f"🔍 Ricerca globale per: '{term}' ({i+1}/{len(search_terms)})")
-            progress_bar.progress((i + 1) / len(search_terms))
-            
-            try:
-                # Ricerca su tutto Reddit
-                search_results = self.reddit.subreddit('all').search(
-                    term, 
-                    time_filter=time_filter,
-                    limit=limit_per_term,
-                    sort='relevance'
-                )
-                
-                for submission in search_results:
-                    if submission.id in processed_ids:
-                        continue
-                    
-                    processed_ids.add(submission.id)
-                    
-                    # Verifica che sia contenuto italiano
-                    if not self._is_italian_content(submission.title + " " + submission.selftext):
-                        continue
-                    
-                    post_data = {
-                        'post_id': submission.id,
-                        'subreddit': submission.subreddit.display_name,
-                        'title': submission.title,
-                        'selftext': submission.selftext,
-                        'author': str(submission.author) if submission.author else '[deleted]',
-                        'url': submission.url,
-                        'reddit_url': f"https://reddit.com{submission.permalink}",
-                        'score': submission.score,
-                        'upvote_ratio': submission.upvote_ratio,
-                        'num_comments': submission.num_comments,
-                        'created_utc': datetime.fromtimestamp(submission.created_utc),
-                        'search_term': term,
-                        'is_question': self._is_question_or_help_request(submission)
-                    }
-                    
-                    all_posts.append(post_data)
-                
-                time.sleep(1)  # Rate limiting tra ricerche
-                
-            except Exception as e:
-                st.error(f"Errore ricerca per '{term}': {e}")
-                continue
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        return all_posts
-    
-    def _is_italian_content(self, text: str) -> bool:
-        """Verifica veloce se il contenuto è italiano"""
+    def _is_target_language_content(self, text: str) -> bool:
+        """Verifica se il contenuto è nella lingua target"""
         if not text or len(text) < 20:
             return False
         
-        italian_indicators = [
-            'sono', 'è', 'ho', 'hai', 'abbiamo', 'hanno',
-            'dove', 'quando', 'come', 'perché', 'cosa', 'chi',
-            'molto', 'poco', 'tutto', 'niente', 'qualcuno',
-            'grazie', 'prego', 'scusa', 'ciao', 'salve',
-            'della', 'dello', 'delle', 'degli', 'nella', 'sulla'
-        ]
-        
+        indicators = self.language_config['indicators']
         text_lower = text.lower()
-        matches = sum(1 for ind in italian_indicators if ind in text_lower)
+        matches = sum(1 for ind in indicators if ind in text_lower)
         
         return matches >= 3
     
@@ -600,16 +626,116 @@ class RedditAIBusinessScraper:
         """Identifica se è una domanda o richiesta di aiuto"""
         text = f"{submission.title} {submission.selftext}".lower()
         
-        for pattern in self.help_patterns:
+        for pattern in self.language_config['help_patterns']:
             if re.search(pattern, text, re.IGNORECASE):
                 return True
         
         return False
     
-    def evaluate_with_multi_agent(self, posts: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """Valuta i post con il sistema multi-agente"""
+    def search_reddit_with_checkpoint(self, search_terms: List[str], time_filter: str = 'month', 
+                                    limit_per_term: int = 30, subreddits: List[str] = None) -> List[Dict]:
+        """Ricerca su Reddit con supporto checkpoint"""
+        all_posts = []
+        processed_ids = set()
         
-        # Aggiorna il multi-agent con le info business correnti
+        # Usa subreddit suggeriti per la lingua se non specificati
+        if not subreddits:
+            subreddits = ['all']  # Ricerca globale di default
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Crea checkpoint iniziale
+        checkpoint_data = {
+            'search_terms': search_terms,
+            'processed_terms': [],
+            'all_posts': [],
+            'processed_ids': set()
+        }
+        
+        for i, term in enumerate(search_terms):
+            status_text.text(f"🔍 Searching for: '{term}' ({i+1}/{len(search_terms)})")
+            progress_bar.progress((i + 1) / len(search_terms))
+            
+            try:
+                # Timeout per la ricerca
+                search_start = time.time()
+                
+                for subreddit_name in subreddits:
+                    if time.time() - search_start > self.search_timeout:
+                        st.warning(f"⚠️ Timeout searching '{term}' in r/{subreddit_name}")
+                        break
+                    
+                    try:
+                        if subreddit_name == 'all':
+                            search_results = self.reddit.subreddit('all').search(
+                                term, 
+                                time_filter=time_filter,
+                                limit=limit_per_term,
+                                sort='relevance'
+                            )
+                        else:
+                            search_results = self.reddit.subreddit(subreddit_name).search(
+                                term,
+                                time_filter=time_filter,
+                                limit=limit_per_term,
+                                sort='relevance'
+                            )
+                        
+                        for submission in search_results:
+                            if submission.id in processed_ids:
+                                continue
+                            
+                            processed_ids.add(submission.id)
+                            
+                            # Verifica lingua
+                            if not self._is_target_language_content(submission.title + " " + submission.selftext):
+                                continue
+                            
+                            post_data = {
+                                'post_id': submission.id,
+                                'subreddit': submission.subreddit.display_name,
+                                'title': submission.title,
+                                'selftext': submission.selftext,
+                                'author': str(submission.author) if submission.author else '[deleted]',
+                                'url': submission.url,
+                                'reddit_url': f"https://reddit.com{submission.permalink}",
+                                'score': submission.score,
+                                'upvote_ratio': submission.upvote_ratio,
+                                'num_comments': submission.num_comments,
+                                'created_utc': datetime.fromtimestamp(submission.created_utc),
+                                'search_term': term,
+                                'is_question': self._is_question_or_help_request(submission)
+                            }
+                            
+                            all_posts.append(post_data)
+                    
+                    except Exception as e:
+                        st.error(f"Error searching r/{subreddit_name}: {e}")
+                        self.session_logger.log_error(f"Search error in r/{subreddit_name}: {e}")
+                        continue
+                
+                # Salva checkpoint dopo ogni termine
+                checkpoint_data['processed_terms'].append(term)
+                checkpoint_data['all_posts'] = all_posts
+                checkpoint_data['processed_ids'] = processed_ids
+                self.checkpoint_manager.create_checkpoint(checkpoint_data)
+                
+                time.sleep(1)  # Rate limiting
+                
+            except Exception as e:
+                st.error(f"Error searching for '{term}': {e}")
+                self.session_logger.log_error(f"Search error for '{term}': {e}")
+                continue
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        return all_posts
+    
+    def evaluate_with_multi_agent_checkpoint(self, posts: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """Valuta i post con sistema multi-agente e checkpoint"""
+        
         self.multi_agent.business_info = self.business_info
         
         strategic_opportunities = []
@@ -618,185 +744,208 @@ class RedditAIBusinessScraper:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for i, post in enumerate(posts):
-            status_text.text(f"🤖 Analisi Multi-Agente post {i+1}/{len(posts)}")
-            progress_bar.progress((i + 1) / len(posts))
+        # Checkpoint per valutazione
+        checkpoint_data = {
+            'evaluated_posts': 0,
+            'strategic_opportunities': [],
+            'rejected_posts': []
+        }
+        
+        batch_size = 10  # Processa in batch per checkpoint frequenti
+        
+        for batch_start in range(0, len(posts), batch_size):
+            batch_end = min(batch_start + batch_size, len(posts))
+            batch = posts[batch_start:batch_end]
             
-            try:
-                # Valutazione completa multi-agente
-                evaluation = self.multi_agent.evaluate_post_complete(post)
+            for i, post in enumerate(batch, batch_start):
+                status_text.text(f"🤖 Multi-Agent Analysis {i+1}/{len(posts)}")
+                progress_bar.progress((i + 1) / len(posts))
                 
-                # Aggiungi i risultati al post
-                post['multi_agent_evaluation'] = evaluation
-                post['overall_score'] = evaluation['overall_score']
-                post['sensitivity_score'] = evaluation['sensitivity_score']
-                post['business_alignment_score'] = evaluation['business_alignment_score']
-                post['priority_score'] = evaluation['priority_score']
-                post['should_engage'] = evaluation['should_engage']
-                post['recommendation'] = evaluation['recommendation']
-                
-                if evaluation['should_engage']:
-                    # Aggiungi dettagli strategici
-                    post['engagement_strategy'] = {
-                        'approach': evaluation.get('engagement_approach', ''),
-                        'tone': evaluation.get('recommended_tone', ''),
-                        'key_points': evaluation.get('key_points', []),
-                        'avoid': evaluation.get('avoid_mentioning', []),
-                        'cta': evaluation.get('suggested_cta', ''),
-                        'impact': evaluation.get('estimated_impact', ''),
-                        'value_proposition': evaluation.get('value_proposition', ''),
-                        'competitive_advantage': evaluation.get('competitive_advantage', ''),
-                        'problem_stage': evaluation.get('problem_stage', '')
-                    }
-                    strategic_opportunities.append(post)
-                else:
-                    post['rejection_reason'] = evaluation.get('rejection_reason', 'Non strategico')
+                try:
+                    # Timeout per valutazione
+                    eval_start = time.time()
+                    
+                    if time.time() - eval_start > self.evaluation_timeout:
+                        st.warning(f"⚠️ Timeout evaluating post {post['post_id']}")
+                        post['rejection_reason'] = 'Evaluation timeout'
+                        rejected_posts.append(post)
+                        continue
+                    
+                    evaluation = self.multi_agent.evaluate_post_complete(post)
+                    
+                    # Aggiungi risultati al post
+                    post['multi_agent_evaluation'] = evaluation
+                    post['overall_score'] = evaluation['overall_score']
+                    post['sensitivity_score'] = evaluation['sensitivity_score']
+                    post['business_alignment_score'] = evaluation['business_alignment_score']
+                    post['priority_score'] = evaluation['priority_score']
+                    post['should_engage'] = evaluation['should_engage']
+                    post['recommendation'] = evaluation['recommendation']
+                    
+                    if evaluation['should_engage']:
+                        post['engagement_strategy'] = {
+                            'approach': evaluation.get('engagement_approach', ''),
+                            'tone': evaluation.get('recommended_tone', ''),
+                            'key_points': evaluation.get('key_points', []),
+                            'avoid': evaluation.get('avoid_mentioning', []),
+                            'cta': evaluation.get('suggested_cta', ''),
+                            'impact': evaluation.get('estimated_impact', ''),
+                            'value_proposition': evaluation.get('value_proposition', ''),
+                            'competitive_advantage': evaluation.get('competitive_advantage', ''),
+                            'problem_stage': evaluation.get('problem_stage', '')
+                        }
+                        strategic_opportunities.append(post)
+                    else:
+                        post['rejection_reason'] = evaluation.get('rejection_reason', 'Not strategic')
+                        rejected_posts.append(post)
+                    
+                    time.sleep(0.5)  # Rate limiting
+                    
+                except Exception as e:
+                    self.logger.error(f"Error evaluating post {post['post_id']}: {e}")
+                    self.session_logger.log_error(f"Evaluation error: {e}")
+                    post['rejection_reason'] = f"Evaluation error: {e}"
                     rejected_posts.append(post)
-                
-                # Rate limiting per OpenAI
-                time.sleep(0.5)
-                
-            except Exception as e:
-                self.logger.error(f"Errore valutazione multi-agente post {post['post_id']}: {e}")
-                post['rejection_reason'] = f"Errore valutazione: {e}"
-                rejected_posts.append(post)
+            
+            # Checkpoint dopo ogni batch
+            checkpoint_data['evaluated_posts'] = batch_end
+            checkpoint_data['strategic_opportunities'] = strategic_opportunities
+            checkpoint_data['rejected_posts'] = rejected_posts
+            self.checkpoint_manager.create_checkpoint(checkpoint_data, f"evaluation_{batch_end}")
         
         progress_bar.empty()
         status_text.empty()
         
-        # Ordina le opportunità strategiche per score
         strategic_opportunities.sort(key=lambda x: x['overall_score'], reverse=True)
         
         return strategic_opportunities, rejected_posts
 
 
-def display_opportunity_card(opp: Dict, index: int):
-    """Visualizza una card dettagliata per un'opportunità strategica"""
+def export_to_excel(opportunities: List[Dict], filename: str = None) -> bytes:
+    """Esporta le opportunità in formato Excel"""
     
-    with st.expander(f"🎯 #{index}. [Score: {opp['overall_score']:.1f}%] {opp['title'][:80]}..."):
+    if not filename:
+        filename = f"reddit_opportunities_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Prepara dati per export
+    export_data = []
+    for opp in opportunities:
+        strategy = opp.get('engagement_strategy', {})
+        export_data.append({
+            'Overall Score': opp['overall_score'],
+            'Business Alignment': opp['business_alignment_score'],
+            'Sensitivity': opp['sensitivity_score'],
+            'Priority': opp['priority_score'],
+            'Subreddit': opp['subreddit'],
+            'Title': opp['title'],
+            'Content': opp['selftext'][:500] if opp['selftext'] else '',
+            'Author': opp['author'],
+            'Reddit URL': opp['reddit_url'],
+            'Comments': opp['num_comments'],
+            'Approach': strategy.get('approach', ''),
+            'Recommended Tone': strategy.get('tone', ''),
+            'Key Points': '|'.join(strategy.get('key_points', [])),
+            'Avoid': '|'.join(strategy.get('avoid', [])),
+            'Suggested CTA': strategy.get('cta', ''),
+            'Value Offered': strategy.get('value_proposition', ''),
+            'Competitive Advantage': strategy.get('competitive_advantage', ''),
+            'Problem Stage': strategy.get('problem_stage', ''),
+            'Estimated Impact': strategy.get('impact', ''),
+            'Created': opp['created_utc'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(opp['created_utc'], datetime) else str(opp['created_utc'])
+        })
+    
+    df = pd.DataFrame(export_data)
+    
+    # Crea file Excel
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Opportunities', index=False)
         
-        # Metriche principali
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("🎯 Score Totale", f"{opp['overall_score']:.1f}%")
-        with col2:
-            st.metric("💼 Business Fit", f"{opp['business_alignment_score']:.0f}%")
-        with col3:
-            st.metric("⚠️ Sensibilità", f"{opp['sensitivity_score']:.0f}%", 
-                     delta=f"Rischio {'Basso' if opp['sensitivity_score'] < 30 else 'Medio' if opp['sensitivity_score'] < 60 else 'Alto'}")
-        with col4:
-            st.metric("⭐ Priorità", f"{opp['priority_score']}/10")
-        
-        # Informazioni post
-        st.write("---")
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.write(f"**📍 Subreddit:** r/{opp['subreddit']}")
-            st.write(f"**👤 Autore:** {opp['author']}")
-            st.write(f"**💬 Commenti:** {opp['num_comments']} | **⬆️ Score:** {opp['score']}")
-            st.write(f"**🔍 Trovato con:** {opp['search_term']}")
-            
-            if opp['selftext']:
-                st.write("**📝 Contenuto:**")
-                st.write(opp['selftext'][:500] + ("..." if len(opp['selftext']) > 500 else ""))
-        
-        with col2:
-            # Strategia di engagement
-            strategy = opp.get('engagement_strategy', {})
-            
-            st.write("**🎯 Strategia Engagement:**")
-            st.info(f"**Approccio:** {strategy.get('approach', 'N/A').title()}")
-            st.info(f"**Tono:** {strategy.get('tone', 'N/A')}")
-            st.info(f"**Impatto:** {strategy.get('impact', 'N/A').title()}")
-            
-            if strategy.get('problem_stage'):
-                stage_emoji = {
-                    'awareness': '👁️',
-                    'consideration': '🤔',
-                    'decision': '✅',
-                    'solved': '🏆'
-                }.get(strategy.get('problem_stage'), '❓')
-                st.write(f"**{stage_emoji} Fase:** {strategy.get('problem_stage', '').title()}")
-        
-        # Punti chiave e cosa evitare
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if strategy.get('key_points'):
-                st.write("**✅ Punti da Affrontare:**")
-                for point in strategy.get('key_points', []):
-                    st.write(f"• {point}")
-        
-        with col2:
-            if strategy.get('avoid'):
-                st.write("**❌ Da Evitare:**")
-                for avoid in strategy.get('avoid', []):
-                    st.write(f"• {avoid}")
-        
-        # Value proposition e vantaggio competitivo
-        if strategy.get('value_proposition'):
-            st.write("**💡 Valore che Possiamo Offrire:**")
-            st.success(strategy.get('value_proposition'))
-        
-        if strategy.get('competitive_advantage'):
-            st.write("**🏆 Nostro Vantaggio Competitivo:**")
-            st.info(strategy.get('competitive_advantage'))
-        
-        # Call to Action suggerita
-        if strategy.get('cta'):
-            st.write("**📣 Call to Action Suggerita:**")
-            st.warning(strategy.get('cta'))
-        
-        # Link al post
-        st.markdown(f"[🔗 Vai al post Reddit]({opp['reddit_url']})")
+        # Formatta le colonne
+        worksheet = writer.sheets['Opportunities']
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+    
+    return output.getvalue()
 
 
 def main():
-    st.title("🤖 Reddit AI Business Scraper - Multi-Agent Edition")
-    st.markdown("### Sistema avanzato di identificazione opportunità strategiche")
+    st.title("🌍 Reddit AI Business Scraper - Multi-Language Edition")
+    st.markdown("### Advanced strategic opportunity identification system")
     
-    # Sidebar per configurazione
+    # Initialize session state
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
+    
+    # Sidebar configuration
     with st.sidebar:
-        st.header("🔧 Configurazione API")
+        st.header("🔧 API Configuration")
         
-        reddit_client_id = st.text_input("Reddit Client ID", type="password")
-        reddit_client_secret = st.text_input("Reddit Client Secret", type="password")
-        reddit_user_agent = st.text_input("Reddit User Agent", value="BusinessScraper/2.0")
-        openai_api_key = st.text_input("OpenAI API Key", type="password")
+        reddit_client_id = st.text_input("Reddit Client ID", type="password", key="reddit_id")
+        reddit_client_secret = st.text_input("Reddit Client Secret", type="password", key="reddit_secret")
+        reddit_user_agent = st.text_input("Reddit User Agent", value="BusinessScraper/3.0", key="reddit_agent")
+        openai_api_key = st.text_input("OpenAI API Key", type="password", key="openai_key")
         
         apis_configured = all([reddit_client_id, reddit_client_secret, reddit_user_agent, openai_api_key])
         
         if apis_configured:
-            st.success("✅ Credenziali inserite")
+            st.success("✅ Credentials configured")
         else:
-            st.warning("⚠️ Inserisci tutte le credenziali")
+            st.warning("⚠️ Enter all credentials")
+        
+        st.header("🌐 Language Settings")
+        selected_language = st.selectbox(
+            "Select Language",
+            options=list(SUPPORTED_LANGUAGES.keys()),
+            format_func=lambda x: SUPPORTED_LANGUAGES[x]['name'],
+            key="language"
+        )
+        
+        # Checkpoint management
+        st.header("💾 Checkpoint Management")
+        checkpoint_manager = CheckpointManager()
+        checkpoints = checkpoint_manager.list_checkpoints()
+        
+        if checkpoints:
+            selected_checkpoint = st.selectbox("Load Checkpoint", ["None"] + checkpoints)
+            if selected_checkpoint != "None" and st.button("Load"):
+                data = checkpoint_manager.load_checkpoint(selected_checkpoint)
+                if data:
+                    st.success("✅ Checkpoint loaded")
+                    st.session_state.checkpoint_data = data
     
-    # Inizializza scraper
-    scraper = RedditAIBusinessScraper()
+    # Initialize scraper with selected language
+    scraper = RedditAIBusinessScraper(language=selected_language)
     
     if not apis_configured:
-        st.info("👈 Inserisci le credenziali API nella sidebar per iniziare")
+        st.info("👈 Enter API credentials in sidebar to start")
         return
     
-    # Configura API
+    # Configure APIs
     if not scraper.initialize_apis(reddit_client_id, reddit_client_secret, reddit_user_agent, openai_api_key):
-        st.error("❌ Errore configurazione API")
+        st.error("❌ API configuration error")
         return
     
-    # Configurazione business
-    st.header("🏢 Configurazione Contesto Business")
+    # Business configuration
+    st.header("🏢 Business Context Configuration")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        brand_name = st.text_input("🏷️ Nome del Brand/Azienda")
-        about_us = st.text_area("📝 Chi Siamo", height=150, 
-                                help="Descrivi brevemente la tua azienda, missione e valori")
+        brand_name = st.text_input("🏷️ Brand/Company Name", key="brand")
+        about_us = st.text_area("📝 About Us", height=150, key="about")
     
     with col2:
-        services = st.text_area("📋 Servizi Offerti", height=150,
-                               help="Elenca i servizi che offri e come aiuti i clienti")
+        services = st.text_area("📋 Services Offered", height=150, key="services")
     
     if brand_name and about_us and services:
         scraper.business_info = {
@@ -805,293 +954,233 @@ def main():
             'services': services,
             'value_proposition': ''
         }
-        
-        # Genera value proposition
-        if st.button("🎯 Genera Value Proposition con AI"):
-            with st.spinner("Generazione value proposition..."):
-                scraper._generate_value_proposition()
-                st.success("✅ Value proposition generata!")
-                st.info(f"💡 **Value Proposition:** {scraper.business_info['value_proposition']}")
     
-    # Configurazione ricerca
-    st.header("🎯 Configurazione Ricerca")
+    # Search configuration
+    st.header("🎯 Search Configuration")
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
         keywords_input = st.text_input(
-            "🔍 Keywords (separate da virgola)",
-            placeholder="mutuo, prestito personale, cessione del quinto",
-            help="Inserisci i termini di ricerca principali"
+            "🔍 Keywords (comma-separated)",
+            placeholder="mortgage, personal loan, investment",
+            key="keywords"
         )
         
         base_topics = [t.strip() for t in keywords_input.split(',') if t.strip()]
     
     with col2:
         time_filter = st.selectbox(
-            "⏰ Periodo di ricerca",
+            "⏰ Time Period",
             options=['week', 'month', 'year'],
-            format_func=lambda x: {
-                'week': '📅 Ultima settimana',
-                'month': '📅 Ultimo mese (consigliato)',
-                'year': '📅 Ultimo anno'
-            }[x],
-            index=1
-        )
-    
-    with col3:
-        use_ai_expansion = st.checkbox(
-            "🤖 Espansione AI Keywords",
-            value=True,
-            help="Espande automaticamente le keyword con sinonimi e variazioni"
+            index=1,
+            key="time_filter"
         )
         
+        # Subreddit selection
+        use_suggested = st.checkbox(
+            f"Use suggested subreddits for {SUPPORTED_LANGUAGES[selected_language]['name']}",
+            value=True
+        )
+        
+        if use_suggested:
+            target_subreddits = SUPPORTED_LANGUAGES[selected_language]['subreddits']
+        else:
+            custom_subreddits = st.text_input("Custom subreddits (comma-separated)")
+            target_subreddits = [s.strip() for s in custom_subreddits.split(',') if s.strip()] or ['all']
+    
+    with col3:
         min_overall_score = st.slider(
-            "🎯 Score Minimo Richiesto",
+            "🎯 Minimum Score Required",
             min_value=50,
             max_value=80,
             value=60,
             step=5,
-            help="Solo opportunità con score complessivo >= a questo valore"
+            key="min_score"
         )
     
-    # Opzioni avanzate
-    with st.expander("⚙️ Opzioni Avanzate"):
-        col1, col2 = st.columns(2)
-        with col1:
-            max_sensitivity = st.slider(
-                "⚠️ Sensibilità Massima Accettabile",
-                min_value=20,
-                max_value=60,
-                value=40,
-                help="Post con sensibilità superiore saranno esclusi"
-            )
-        with col2:
-            min_priority = st.slider(
-                "⭐ Priorità Minima",
-                min_value=3,
-                max_value=8,
-                value=5,
-                help="Solo opportunità con priorità >= a questo valore"
-            )
-    
-    # Avvia ricerca
-    if st.button("🚀 Avvia Analisi Multi-Agente", type="primary") and base_topics:
+    # Start search
+    if st.button("🚀 Start Multi-Agent Analysis", type="primary") and base_topics:
         
         if not (brand_name and about_us and services):
-            st.error("❌ Completa prima la configurazione business!")
+            st.error("❌ Complete business configuration first!")
             return
         
-        st.header("📊 Risultati Analisi")
+        # Update session logger
+        scraper.session_logger.update_session(
+            language=selected_language,
+            keywords=base_topics,
+            filters_applied={
+                'min_score': min_overall_score,
+                'time_filter': time_filter,
+                'subreddits': target_subreddits
+            }
+        )
         
-        # 1. Espansione termini (se richiesta)
-        if use_ai_expansion:
-            with st.expander("🔍 Espansione termini di ricerca"):
-                all_search_terms = []
-                for topic in base_topics:
-                    expanded = scraper.expand_search_terms(topic)
-                    all_search_terms.extend(expanded)
-                    st.write(f"**{topic}:** {', '.join(expanded[:8])}")
-                
-                # Rimuovi duplicati
-                seen = set()
-                unique_search_terms = []
-                for term in all_search_terms:
-                    if term.lower() not in seen:
-                        seen.add(term.lower())
-                        unique_search_terms.append(term)
-                
-                st.info(f"📊 Totale termini unici: {len(unique_search_terms)}")
-        else:
-            unique_search_terms = base_topics
-            st.info(f"🔍 Ricerca diretta per: {', '.join(base_topics)}")
+        st.header("📊 Analysis Results")
         
-        # 2. Ricerca Reddit
-        st.subheader("🌐 Fase 1: Ricerca su Reddit")
-        with st.spinner("Ricerca post in corso..."):
-            all_posts = scraper.search_reddit_globally(unique_search_terms, time_filter, limit_per_term=30)
+        # Phase 1: Reddit search
+        st.subheader(f"🌐 Phase 1: Searching Reddit ({SUPPORTED_LANGUAGES[selected_language]['name']})")
+        with st.spinner("Searching posts..."):
+            all_posts = scraper.search_reddit_with_checkpoint(
+                base_topics, 
+                time_filter, 
+                limit_per_term=30, 
+                subreddits=target_subreddits
+            )
         
         if not all_posts:
-            st.warning("❌ Nessun post trovato!")
+            st.warning("❌ No posts found!")
+            scraper.session_logger.save_session()
             return
         
-        st.success(f"✅ Trovati {len(all_posts)} post italiani pertinenti")
+        st.success(f"✅ Found {len(all_posts)} relevant posts")
+        scraper.session_logger.update_session(posts_found=len(all_posts))
         
-        # 3. Analisi Multi-Agente
-        st.subheader("🤖 Fase 2: Analisi Multi-Agente")
-        with st.spinner(f"Analisi strategica di {len(all_posts)} post..."):
-            strategic_opportunities, rejected_posts = scraper.evaluate_with_multi_agent(all_posts)
+        # Phase 2: Multi-Agent analysis
+        st.subheader("🤖 Phase 2: Multi-Agent Analysis")
+        with st.spinner(f"Strategic analysis of {len(all_posts)} posts..."):
+            strategic_opportunities, rejected_posts = scraper.evaluate_with_multi_agent_checkpoint(all_posts)
         
-        # Applica filtri aggiuntivi
+        # Apply additional filters
         filtered_opportunities = [
             opp for opp in strategic_opportunities 
-            if opp['overall_score'] >= min_overall_score 
-            and opp['sensitivity_score'] <= max_sensitivity
-            and opp['priority_score'] >= min_priority
+            if opp['overall_score'] >= min_overall_score
         ]
         
-        # 4. Risultati
-        st.header("🎯 Risultati Finali")
+        # Update session logger
+        scraper.session_logger.update_session(
+            opportunities_identified=len(filtered_opportunities)
+        )
+        scraper.session_logger.save_session()
         
-        # Metriche principali
+        # Save results to session state
+        st.session_state.analysis_results = {
+            'opportunities': filtered_opportunities,
+            'base_topics': base_topics,
+            'brand_name': brand_name,
+            'language': selected_language,
+            'timestamp': datetime.now()
+        }
+        
+        # Results display
+        st.header("🎯 Final Results")
+        
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("📊 Post Analizzati", len(all_posts))
+            st.metric("📊 Posts Analyzed", len(all_posts))
         
         with col2:
-            st.metric("✅ Opportunità Strategiche", len(filtered_opportunities),
-                     delta=f"-{len(all_posts) - len(filtered_opportunities)} filtrati")
+            st.metric("✅ Strategic Opportunities", len(filtered_opportunities))
         
         with col3:
             if filtered_opportunities:
                 avg_score = sum(o['overall_score'] for o in filtered_opportunities) / len(filtered_opportunities)
-                st.metric("📈 Score Medio", f"{avg_score:.1f}%")
+                st.metric("📈 Average Score", f"{avg_score:.1f}%")
             else:
-                st.metric("📈 Score Medio", "N/A")
+                st.metric("📈 Average Score", "N/A")
         
         with col4:
             high_priority = len([o for o in filtered_opportunities if o['priority_score'] >= 7])
-            st.metric("🔥 Alta Priorità", high_priority)
+            st.metric("🔥 High Priority", high_priority)
+    
+    # Display results from session state (persists across downloads)
+    if st.session_state.analysis_results:
+        filtered_opportunities = st.session_state.analysis_results['opportunities']
         
-        # 5. Analisi dettagliata opportunità
         if filtered_opportunities:
-            st.subheader(f"🏆 {len(filtered_opportunities)} Opportunità Strategiche Identificate")
+            st.subheader(f"🏆 {len(filtered_opportunities)} Strategic Opportunities")
             
-            # Filtri visualizzazione
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                show_approach = st.selectbox(
-                    "Filtra per Approccio",
-                    ["Tutti"] + list(set(o.get('engagement_strategy', {}).get('approach', '') 
-                                       for o in filtered_opportunities if o.get('engagement_strategy', {}).get('approach')))
-                )
-            with col2:
-                show_impact = st.selectbox(
-                    "Filtra per Impatto",
-                    ["Tutti", "high", "medium", "low"]
-                )
-            with col3:
-                sort_by = st.selectbox(
-                    "Ordina per",
-                    ["Score Totale", "Business Alignment", "Priorità", "Sensibilità"]
-                )
-            
-            # Applica filtri e ordinamento
-            displayed_opportunities = filtered_opportunities.copy()
-            
-            if show_approach != "Tutti":
-                displayed_opportunities = [o for o in displayed_opportunities 
-                                         if o.get('engagement_strategy', {}).get('approach') == show_approach]
-            
-            if show_impact != "Tutti":
-                displayed_opportunities = [o for o in displayed_opportunities 
-                                         if o.get('engagement_strategy', {}).get('impact') == show_impact]
-            
-            # Ordinamento
-            sort_keys = {
-                "Score Totale": lambda x: x['overall_score'],
-                "Business Alignment": lambda x: x['business_alignment_score'],
-                "Priorità": lambda x: x['priority_score'],
-                "Sensibilità": lambda x: -x['sensitivity_score']  # Inverso per sensibilità
-            }
-            displayed_opportunities.sort(key=sort_keys[sort_by], reverse=True)
-            
-            # Visualizza opportunità
-            for i, opp in enumerate(displayed_opportunities[:20], 1):
-                display_opportunity_card(opp, i)
-        
-        else:
-            st.warning("❌ Nessuna opportunità strategica trovata con i criteri specificati")
-            
-            # Mostra alcuni post rifiutati per context
-            if rejected_posts:
-                with st.expander(f"📊 Analisi {len(rejected_posts)} post esclusi"):
-                    rejection_reasons = {}
-                    for post in rejected_posts[:10]:
-                        reason = post.get('rejection_reason', 'Non specificato')
-                        if reason not in rejection_reasons:
-                            rejection_reasons[reason] = 0
-                        rejection_reasons[reason] += 1
+            # Display opportunities
+            for i, opp in enumerate(filtered_opportunities[:20], 1):
+                with st.expander(f"#{i}. [Score: {opp['overall_score']:.1f}%] {opp['title'][:80]}..."):
+                    col1, col2 = st.columns([2, 1])
                     
-                    st.write("**Motivi di esclusione:**")
-                    for reason, count in rejection_reasons.items():
-                        st.write(f"• {reason}: {count} post")
-        
-        # 6. Export risultati
-        if filtered_opportunities:
-            st.subheader("💾 Export Risultati")
+                    with col1:
+                        st.write(f"**📍 Subreddit:** r/{opp['subreddit']}")
+                        st.write(f"**👤 Author:** {opp['author']}")
+                        st.write(f"**💬 Comments:** {opp['num_comments']}")
+                        
+                        if opp['selftext']:
+                            st.write("**📝 Content:**")
+                            st.write(opp['selftext'][:300] + ("..." if len(opp['selftext']) > 300 else ""))
+                    
+                    with col2:
+                        strategy = opp.get('engagement_strategy', {})
+                        st.info(f"**Approach:** {strategy.get('approach', 'N/A')}")
+                        st.info(f"**Impact:** {strategy.get('impact', 'N/A')}")
+                    
+                    st.markdown(f"[🔗 Go to Reddit post]({opp['reddit_url']})")
             
-            # Prepara dati per export
-            export_data = []
-            for opp in filtered_opportunities:
-                strategy = opp.get('engagement_strategy', {})
-                export_data.append({
-                    'score_totale': opp['overall_score'],
-                    'business_alignment': opp['business_alignment_score'],
-                    'sensitivita': opp['sensitivity_score'],
-                    'priorita': opp['priority_score'],
-                    'subreddit': opp['subreddit'],
-                    'titolo': opp['title'],
-                    'contenuto': opp['selftext'][:500] if opp['selftext'] else '',
-                    'autore': opp['author'],
-                    'url_reddit': opp['reddit_url'],
-                    'num_commenti': opp['num_comments'],
-                    'approccio': strategy.get('approach', ''),
-                    'tono_consigliato': strategy.get('tone', ''),
-                    'punti_chiave': '|'.join(strategy.get('key_points', [])),
-                    'da_evitare': '|'.join(strategy.get('avoid', [])),
-                    'cta_suggerita': strategy.get('cta', ''),
-                    'valore_offerto': strategy.get('value_proposition', ''),
-                    'vantaggio_competitivo': strategy.get('competitive_advantage', ''),
-                    'fase_problema': strategy.get('problem_stage', ''),
-                    'impatto_stimato': strategy.get('impact', '')
-                })
+            # Export section
+            st.subheader("💾 Export Results")
             
-            df = pd.DataFrame(export_data)
+            col1, col2, col3, col4 = st.columns(4)
             
-            # CSV download
-            csv = df.to_csv(index=False)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = st.session_state.analysis_results['timestamp'].strftime("%Y%m%d_%H%M%S")
             
-            col1, col2 = st.columns(2)
             with col1:
+                # CSV export
+                df = pd.DataFrame([{
+                    'Score': opp['overall_score'],
+                    'Subreddit': opp['subreddit'],
+                    'Title': opp['title'],
+                    'URL': opp['reddit_url']
+                } for opp in filtered_opportunities])
+                
+                csv = df.to_csv(index=False)
                 st.download_button(
-                    label="📊 Scarica CSV Completo",
+                    label="📊 Download CSV",
                     data=csv,
-                    file_name=f"reddit_opportunities_strategic_{timestamp}.csv",
-                    mime="text/csv"
+                    file_name=f"reddit_opportunities_{timestamp}.csv",
+                    mime="text/csv",
+                    key="csv_download"
                 )
             
             with col2:
-                # JSON download con tutti i dettagli
+                # Excel export
+                excel_data = export_to_excel(filtered_opportunities)
+                st.download_button(
+                    label="📑 Download Excel",
+                    data=excel_data,
+                    file_name=f"reddit_opportunities_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="excel_download"
+                )
+            
+            with col3:
+                # JSON export
                 json_data = {
                     'timestamp': timestamp,
-                    'business': brand_name,
-                    'keywords': base_topics,
-                    'total_posts_analyzed': len(all_posts),
-                    'strategic_opportunities': len(filtered_opportunities),
-                    'filters_applied': {
-                        'min_overall_score': min_overall_score,
-                        'max_sensitivity': max_sensitivity,
-                        'min_priority': min_priority
-                    },
-                    'opportunities': [
-                        {
-                            **opp,
-                            'created_utc': opp['created_utc'].isoformat() if isinstance(opp['created_utc'], datetime) else str(opp['created_utc'])
-                        } 
-                        for opp in filtered_opportunities
-                    ]
+                    'language': st.session_state.analysis_results['language'],
+                    'keywords': st.session_state.analysis_results['base_topics'],
+                    'opportunities': [{
+                        **opp,
+                        'created_utc': opp['created_utc'].isoformat() if isinstance(opp['created_utc'], datetime) else str(opp['created_utc'])
+                    } for opp in filtered_opportunities]
                 }
                 
                 json_str = json.dumps(json_data, indent=2, ensure_ascii=False)
                 st.download_button(
-                    label="📄 Scarica JSON Dettagliato",
+                    label="📄 Download JSON",
                     data=json_str,
-                    file_name=f"reddit_opportunities_detailed_{timestamp}.json",
-                    mime="application/json"
+                    file_name=f"reddit_opportunities_{timestamp}.json",
+                    mime="application/json",
+                    key="json_download"
                 )
+            
+            with col4:
+                # Log export
+                log_data = scraper.session_logger.export_to_excel()
+                if log_data:
+                    st.download_button(
+                        label="📜 Download Session Log",
+                        data=log_data,
+                        file_name=f"session_log_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="log_download"
+                    )
 
 if __name__ == "__main__":
     main()
